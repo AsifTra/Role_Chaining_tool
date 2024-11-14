@@ -3,17 +3,14 @@ import botocore.exceptions
 import argparse
 import json
 import sys
+import os
+import random
+import string
+from configparser import ConfigParser
 from termcolor import cprint
 from datetime import datetime
 
-def parse_arguments():
-    """Parse command-line arguments."""
-    parser = argparse.ArgumentParser(description='AWS Role Chaining Tool')
-    parser.add_argument('-p', '--profile', default="default", metavar='profile', type=str, required=False, help='Specify an AWS profile')
-    return parser.parse_args()
-
 def get_session(profile):
-    """Initialize a boto3 session."""
     try:
         return boto3.Session(profile_name=profile)
     except Exception as e:
@@ -21,18 +18,16 @@ def get_session(profile):
         sys.exit(1)
 
 def authenticate_user(session):
-    """Authenticate the user and return their ARN."""
     try:
         client = session.client('sts')
         response = client.get_caller_identity()
         cprint('Authenticated!\n', 'green')
-        return response['Arn']
+        return response['Arn'], response['Account']
     except Exception as e:
         cprint(f'Error authenticating user:\n{e}', 'red')
         sys.exit(1)
 
 def get_permisive_roles(session, user_arn):
-    """Check if the given user has permission on a given role."""
     client = session.client('iam')
     roles = []
     try:
@@ -56,7 +51,6 @@ def get_permisive_roles(session, user_arn):
             sys.exit(1)
 
 def get_role_permission(policy_document, user_arn):
-    """Helper to get_permisive_roles function, help parse the document policy."""
     for statement in policy_document.get('Statement', []):
         if statement.get('Effect') == 'Allow' and 'Principal' in statement:
             principal_arns = statement['Principal'].get('AWS', [])
@@ -66,11 +60,10 @@ def get_role_permission(policy_document, user_arn):
                 return True
     return False
 
-def role_chaning_check(session, permisive_roles):
-    """For each permisive role, check both inline and managed policies to see if the role allows assuming another role."""
+def role_chaning_check(session, permisive_roles, mode, return_profile_name):
     client = session.client('iam')
     role_chaining_found = False
-    assumable_roles = []  # List to store all roles allowing role chaining
+    assumable_roles = []
 
     for role in permisive_roles:
         role_name = role['RoleName']
@@ -78,12 +71,12 @@ def role_chaning_check(session, permisive_roles):
 
         if check_policies(session, role_name, role_arn, client.get_paginator('list_role_policies'), get_role_policy) or \
            check_policies(session, role_name, role_arn, client.get_paginator('list_attached_role_policies'), get_managed_policy):
-            creds = assume_user_role(session, role_name, role_arn)
-            if creds:
+            role_chain_creds = assume_user_role(session, role_name, role_arn, mode, return_profile_name)
+            if role_chain_creds:
                 assumable_roles.append(role_name)
                 role_chaining_found = True
                 cprint(f"Assumed role credentials from '{role_name}' role:", "green")
-                print(json.dumps(creds, default=convert_datetime, indent=2))
+            return role_chain_creds
 
     if not role_chaining_found:
         cprint("No roles found that allow chaining.", "red")
@@ -91,7 +84,6 @@ def role_chaning_check(session, permisive_roles):
         cprint(f"Roles that allow chaining: {', '.join(assumable_roles)}", "green")
 
 def check_policies(session, role_name, role_arn, paginator, policy_fetcher):
-    """Helper function to determine whether the policy (of each permisive role) is managed or inline."""
     role_allows_assume_role = False
     for page in paginator.paginate(RoleName=role_name):
         for policy in page.get('PolicyNames', []) + page.get('AttachedPolicies', []):
@@ -104,46 +96,80 @@ def check_policies(session, role_name, role_arn, paginator, policy_fetcher):
     return role_allows_assume_role
 
 def get_role_policy(session, role_name, policy_name):
-    """Helper function for check_policies function, returning the role policies of inline policies."""
     client = session.client('iam')
     return client.get_role_policy(RoleName=role_name, PolicyName=policy_name)['PolicyDocument']
 
 def get_managed_policy(session, role_name, policy):
-    """Helper function for check_policies function, returning the role policies of managed policies."""
     client = session.client('iam')
     policy_arn = policy['PolicyArn']
     policy_version = client.get_policy(PolicyArn=policy_arn)['Policy']['DefaultVersionId']
     return client.get_policy_version(PolicyArn=policy_arn, VersionId=policy_version)['PolicyVersion']['Document']
 
 def policy_allows_assume_role(policy_document):
-    """Helper function for check_policies function, Check if a policy document allows assuming a role."""
     for statement in policy_document.get('Statement', []):
         if statement.get('Effect') == 'Allow' and 'sts:AssumeRole' in statement.get('Action', []):
             return True
     return False
 
-def assume_user_role(session, role_name, role_arn):
-    """Assume the specified role and return temporary credentials."""
+def assume_user_role(session, role_name, role_arn, mode, return_profile_name):
     client = session.client('sts')
     try:
         assumed_role_object = client.assume_role(RoleArn=role_arn, RoleSessionName=role_name, DurationSeconds=3600)
-        return assumed_role_object['Credentials']
+        role_creds = assumed_role_object['Credentials']
+        if mode == "automated":
+            aws_credentials_path = os.path.expanduser("~/.aws/credentials")
+            config = ConfigParser()
+            config.read(aws_credentials_path)
+            config[return_profile_name] = {
+            "aws_access_key_id": role_creds['AccessKeyId'],
+            "aws_secret_access_key": role_creds['SecretAccessKey'],
+            "aws_session_token": role_creds['SessionToken']
+        }
+            with open(aws_credentials_path, 'w') as configfile:
+                config.write(configfile)
+            cprint(f"Temporary credentials saved to profile '{return_profile_name}'", "green")
+            return return_profile_name
+        else:
+            return role_creds
     except Exception as e:
         cprint(f'Error assuming role {role_name}:\n{e}', 'red')
         return None
 
 def convert_datetime(obj):
-    """Convert datetime objects to string for JSON serialization."""
     if isinstance(obj, datetime):
         return obj.isoformat()
     raise TypeError("Type not serializable")
 
-def main():
-    args = parse_arguments()
-    session = get_session(args.profile)
-    user_arn = authenticate_user(session)
-    permisive_roles = get_permisive_roles(session, user_arn)
-    role_chaning_check(session, permisive_roles)
+def main() -> None:
+    parser = argparse.ArgumentParser(description="AWS Role Chaining Tool")
+    parser.add_argument(
+        "-m",
+        "--mode",
+        choices=["discovery", "automated"],
+        required=True,
+        help="Mode of operation: 'discovery' to find permissive roles or 'automated' for role chaining.",
+    )
+    parser.add_argument("-p", "--profile", default="default", help="AWS profile to use (for discovery mode only).")
+    parser.add_argument("-r", "--role", help="Role ARN for chaining (required for automated mode).")
+    args = parser.parse_args()
 
-if __name__ == '__main__':
+    session = get_session(args.profile)
+    user_arn, account_id = authenticate_user(session)
+    name_prefix = "RoleChainProfile"
+    random_suffix = ''.join(random.choices(string.ascii_letters + string.digits, k=6))
+    return_profile_name = name_prefix + "_" + random_suffix
+ 
+    if args.mode == "automated" and not args.role:
+        parser.error("the following argument is required for automated mode: -r/--role")
+
+    if args.mode == "discovery":
+        permisive_roles = get_permisive_roles(session, user_arn)
+        role_chain_creds = role_chaning_check(session, permisive_roles, args.mode, return_profile_name)
+        print(json.dumps(role_chain_creds, default=convert_datetime, indent=2))
+    
+    elif args.mode == "automated":
+        role_arn = f"arn:aws:iam::{account_id}:role/{args.role}"
+        assume_user_role(session, args.role, role_arn, args.mode, return_profile_name)
+
+if __name__ == "__main__":
     main()
