@@ -1,11 +1,9 @@
 boto3
 botocore
 argparse
-json
 sys
 os
 termcolor
-datetime
 configparser
 string
 random

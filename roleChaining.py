@@ -1,14 +1,12 @@
 import boto3
 import botocore.exceptions
 import argparse
-import json
 import sys
 import os
 import random
 import string
 from configparser import ConfigParser
 from termcolor import cprint
-from datetime import datetime
 
 def get_session(profile):
     try:
@@ -68,18 +66,23 @@ def role_chaining_check(session, permissive_roles):
         if assumable_roles:
             chainable_roles.append({
                 'RoleName': role_name,
+                'RoleArn': role_arn,
                 'AssumableRoles': assumable_roles
             })
             role_chaining_found = True
+            
+            cprint(f"Role '{role_name}' can assume the following roles:", "green")
+            for assumable_role in assumable_roles:
+                cprint(f" - {assumable_role}", "green")
+            
+            profile_name = f"RoleChainProfile_{''.join(random.choices(string.ascii_letters + string.digits, k=6))}"
+            role1_creds = assume_user_role(session, role_name, role_arn, profile_name)
+            if role1_creds:
+                cprint(f"\nTo chain to '{assumable_roles[0]}', save these credentials for '{role_name}' and run:", "yellow")
+                print(f"python3 RoleChaining.py -m automated -p {profile_name} -r {assumable_roles[0]}\n")
 
     if not role_chaining_found:
         cprint("No roles found that allow chaining.", "red")
-    else:
-        cprint("Roles that allow chaining:", "green")
-        for role in chainable_roles:
-            print(f" - Role Name: {role['RoleName']}")
-            for assumable_role in role['AssumableRoles']:
-                print(f"   -> Can assume: {assumable_role}")
 
 def check_policies_for_chaining(session, role_name, role_arn):
     """Check both inline and managed policies for sts:AssumeRole permissions."""
@@ -130,7 +133,6 @@ def assume_user_role(session, role_name, role_arn, profile_name):
         )
         role_creds = assumed_role_object['Credentials']
         
-        # Write the credentials to the specified profile
         aws_credentials_path = os.path.expanduser("~/.aws/credentials")
         config = ConfigParser()
         config.read(aws_credentials_path)
@@ -142,18 +144,38 @@ def assume_user_role(session, role_name, role_arn, profile_name):
         with open(aws_credentials_path, 'w') as configfile:
             config.write(configfile)
         
-        cprint(f"Temporary credentials saved to profile '{profile_name}'", "green")
+        cprint(f"Temporary credentials of {role_name} saved to profile '{profile_name}'", "green")
         return profile_name
     except Exception as e:
         cprint(f'Error assuming role {role_name}:\n{e}', 'red')
         return None
+    
+def cleanup_profiles():
+    aws_credentials_path = os.path.expanduser("~/.aws/credentials")
+    config = ConfigParser()
+    config.read(aws_credentials_path)
+    
+    profiles_to_delete = [section for section in config.sections() if section.startswith("RoleChainProfile_") or section.startswith("TargetRoleProfile_")]
+    
+    if not profiles_to_delete:
+        cprint("No profiles found for cleanup.", "yellow")
+        return
+    
+    for profile in profiles_to_delete:
+        config.remove_section(profile)
+        cprint(f"Deleted profile '{profile}' from credentials file.", "green")
+    
+    with open(aws_credentials_path, 'w') as configfile:
+        config.write(configfile)
+    
+    cprint("Cleanup completed successfully.", "green")
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="AWS Role Chaining Tool")
     parser.add_argument(
         "-m",
         "--mode",
-        choices=["discovery", "automated"],
+        choices=["discovery", "automated", "cleanup"],
         required=True,
         help="Mode of operation: 'discovery' to find permissive roles or 'automated' for role chaining.",
     )
@@ -173,11 +195,15 @@ def main() -> None:
             parser.error("the following argument is required for automated mode: -r/--role")
         
         role_arn = f"arn:aws:iam::{account_id}:role/{args.role}"
-        profile_name = "RoleChainProfile_" + ''.join(random.choices(string.ascii_letters + string.digits, k=6))
+        target_profile_name = f"TargetRoleProfile_{''.join(random.choices(string.ascii_letters + string.digits, k=6))}"
         
-        result_profile = assume_user_role(session, args.role, role_arn, profile_name)
+        result_profile = assume_user_role(session, args.role, role_arn, target_profile_name)
         if result_profile:
+            print(f"Target role credentials saved to profile '{result_profile}'.")
             print(f"You can now use the profile with AWS CLI by specifying --profile {result_profile}")
+    
+    elif args.mode == "cleanup":
+        cleanup_profiles()
 
 if __name__ == "__main__":
     main()
