@@ -26,11 +26,13 @@ def authenticate_user(session):
         sys.exit(1)
 
 def get_permissive_roles(session, user_arn):
+    """Gets all the roles that the user is allows to list theirs policies."""
     client = session.client('iam')
     roles = []
     try:
         for page in client.get_paginator('list_roles').paginate():
             roles.extend(page['Roles'])
+
         permissive_roles = []
         for role in roles:
             if get_role_permission(role['AssumeRolePolicyDocument'], user_arn):
@@ -78,7 +80,7 @@ def role_chaining_check(session, permissive_roles):
             profile_name = f"RoleChainProfile_{''.join(random.choices(string.ascii_letters + string.digits, k=6))}"
             role1_creds = assume_user_role(session, role_name, role_arn, profile_name)
             if role1_creds:
-                cprint(f"\nTo chain to '{assumable_roles[0]}', save these credentials for '{role_name}' and run:", "yellow")
+                cprint(f"\nTo chain to '{assumable_roles[0]}', save these credentials for '{role_name}' or run:", "yellow")
                 print(f"python3 RoleChaining.py -m automated -p {profile_name} -r {assumable_roles[0]}\n")
 
     if not role_chaining_found:
@@ -123,7 +125,7 @@ def get_managed_policy(session, role_name, policy):
     return client.get_policy_version(PolicyArn=policy_arn, VersionId=policy_version)['PolicyVersion']['Document']
 
 def assume_user_role(session, role_name, role_arn, profile_name):
-    """Assumes the role and saves credentials to the specified profile name."""
+    """Assumes the role and saves credentials to the specified profile name (used by automated mode)."""
     client = session.client('sts')
     try:
         assumed_role_object = client.assume_role(
